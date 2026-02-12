@@ -1,0 +1,19 @@
+INFO:     Started server process [16948]
+INFO:     Waiting for application startup.
+INFO:app.main:Starting SmartCall AI
+WARNING:app.services.queue:Redis unavailable, queue disabled: Error 10061 connecting to localhost:6379. No connection could be made because the target machine actively refused it.
+INFO:app.services.transcription:Loading Whisper model: base on cpu
+WARNING:app.services.transcription:faster-whisper is not installed; transcription will return empty results
+INFO:app.main:transcription service ready
+INFO:app.services.sentiment:Loading sentiment model: distilbert-base-uncased-finetuned-sst-2-english
+WARNING:app.services.sentiment:transformers/torch not installed; using rule-based sentiment fallback
+INFO:app.main:sentiment service ready
+INFO:app.services.summary:Using rule-based summarization (no API key)
+INFO:app.main:summary service ready
+INFO:app.main:scoring service ready
+INFO:app.main:Service initialization complete
+INFO:app.workers.post_call_worker:Post-call worker started
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
+INFO:app.routes.calls:Started call id=340c4602-eccd-41c2-8c9a-b3839bb71a4c tenant=pilot-acme
+INFO:app.services.crm:CRM sync requested provider=zoho call_id=340c4602-eccd-41c2-8c9a-b3839bb71a4c
