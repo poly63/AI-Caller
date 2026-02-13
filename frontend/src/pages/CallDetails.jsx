@@ -1,17 +1,32 @@
-import React, { useState, useEffect } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { ArrowLeft, Phone, User, Clock, TrendingUp, AlertTriangle } from 'lucide-react';
-import { callsAPI } from '../services/api';
+import { CallWebSocket, callsAPI } from '../services/api';
 
 const CallDetails = () => {
   const { callId } = useParams();
   const navigate = useNavigate();
   const [call, setCall] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [wsConnected, setWsConnected] = useState(false);
+  const [liveInput, setLiveInput] = useState('');
+  const [liveEvents, setLiveEvents] = useState([]);
+  const [sourceLang, setSourceLang] = useState('auto');
+  const [targetLang, setTargetLang] = useState('en');
+  const [speaker, setSpeaker] = useState('agent');
+  const wsRef = useRef(null);
 
   useEffect(() => {
     fetchCallDetails();
   }, [callId]);
+
+  useEffect(() => {
+    return () => {
+      if (wsRef.current) {
+        wsRef.current.disconnect();
+      }
+    };
+  }, []);
 
   const fetchCallDetails = async () => {
     try {
@@ -36,6 +51,48 @@ const CallDetails = () => {
     if (score >= 80) return 'text-green-600';
     if (score >= 60) return 'text-yellow-600';
     return 'text-red-600';
+  };
+
+  const connectLiveSocket = () => {
+    if (wsRef.current?.isConnected()) return;
+    const stream = new CallWebSocket(callId);
+    wsRef.current = stream;
+    stream.connect(
+      (message) => {
+        setWsConnected(true);
+        if (message?.type === 'transcript' || message?.type === 'config_ack') {
+          setLiveEvents((prev) => [message, ...prev].slice(0, 80));
+        }
+      },
+      () => {
+        setWsConnected(false);
+      },
+      () => {
+        setWsConnected(false);
+      }
+    );
+    setTimeout(() => {
+      stream.send({ type: 'config', speaker, source_lang: sourceLang, target_lang: targetLang });
+    }, 300);
+  };
+
+  const disconnectLiveSocket = () => {
+    wsRef.current?.disconnect();
+    setWsConnected(false);
+  };
+
+  const sendLiveChunk = () => {
+    const text = liveInput.trim();
+    if (!text || !wsRef.current?.isConnected()) return;
+    wsRef.current.send({
+      type: 'transcript',
+      speaker,
+      source_lang: sourceLang,
+      target_lang: targetLang,
+      text,
+      timestamp: Date.now() / 1000,
+    });
+    setLiveInput('');
   };
 
   if (loading) {
@@ -187,6 +244,82 @@ const CallDetails = () => {
               </div>
             </div>
           )}
+
+          {/* Live Translate */}
+          <div className="bg-gray-50 rounded-lg p-6 mt-8">
+            <h3 className="font-semibold mb-4">Live Translate Stream</h3>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mb-3">
+              <input
+                className="border rounded px-3 py-2 text-sm"
+                value={speaker}
+                onChange={(e) => setSpeaker(e.target.value)}
+                placeholder="speaker (agent/customer)"
+              />
+              <input
+                className="border rounded px-3 py-2 text-sm"
+                value={sourceLang}
+                onChange={(e) => setSourceLang(e.target.value)}
+                placeholder="source lang"
+              />
+              <input
+                className="border rounded px-3 py-2 text-sm"
+                value={targetLang}
+                onChange={(e) => setTargetLang(e.target.value)}
+                placeholder="target lang"
+              />
+            </div>
+            <div className="flex gap-3 mb-3">
+              <button
+                onClick={connectLiveSocket}
+                className="px-4 py-2 rounded bg-blue-600 text-white text-sm disabled:opacity-60"
+                disabled={wsConnected}
+              >
+                Connect
+              </button>
+              <button
+                onClick={disconnectLiveSocket}
+                className="px-4 py-2 rounded bg-gray-200 text-gray-800 text-sm disabled:opacity-60"
+                disabled={!wsConnected}
+              >
+                Disconnect
+              </button>
+              <span className={`text-sm self-center ${wsConnected ? 'text-green-600' : 'text-gray-500'}`}>
+                {wsConnected ? 'Live connected' : 'Disconnected'}
+              </span>
+            </div>
+            <div className="flex gap-2 mb-4">
+              <input
+                className="flex-1 border rounded px-3 py-2 text-sm"
+                placeholder="Type transcript chunk and send..."
+                value={liveInput}
+                onChange={(e) => setLiveInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') sendLiveChunk();
+                }}
+              />
+              <button
+                onClick={sendLiveChunk}
+                className="px-4 py-2 rounded bg-emerald-600 text-white text-sm disabled:opacity-60"
+                disabled={!wsConnected || !liveInput.trim()}
+              >
+                Send
+              </button>
+            </div>
+            <div className="bg-white rounded border max-h-72 overflow-y-auto p-3 space-y-2">
+              {liveEvents.length === 0 && <p className="text-sm text-gray-500">No live events yet.</p>}
+              {liveEvents.map((item, idx) => (
+                <div key={`${item.timestamp || 't'}-${idx}`} className="text-sm border-b pb-2">
+                  <div className="font-medium text-gray-700">
+                    {item.speaker || '-'} {item.type === 'transcript' ? 'said:' : item.type}
+                  </div>
+                  {item.text && <div className="text-gray-800">{item.text}</div>}
+                  {item.translated_text && (
+                    <div className="text-blue-700">Translated: {item.translated_text}</div>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
 
           {/* Flags */}
           {(call.escalation_required || call.contains_profanity) && (

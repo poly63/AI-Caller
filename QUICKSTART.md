@@ -129,6 +129,33 @@ print(f"SmartCall Call ID: {call_id}")
 # (Implementation depends on your setup)
 ```
 
+### MicroSIP + Asterisk Auto Bridge (from zip watcher flow)
+
+If your calls are being recorded by Asterisk in `/var/spool/asterisk/monitor`, run this bridge:
+
+```bash
+cd backend
+source .venv/bin/activate
+pip install -r requirements.txt
+python scripts/asterisk_bridge.py
+```
+
+Optional env vars:
+
+```bash
+export ASTERISK_MONITOR_DIR=/var/spool/asterisk/monitor
+export SMARTCALL_API_BASE=http://127.0.0.1:8000/api
+export SMARTCALL_TARGET_LANG=hi
+```
+
+What it does:
+- detects new `.wav` recordings
+- waits for file completion
+- converts to 16k mono
+- transcribes with faster-whisper
+- pushes transcript to SmartCall API
+- auto ends/analyzes the call
+
 ## 🚀 Next Steps
 
 ### 1. Customize Scoring Rules

@@ -189,6 +189,16 @@ export class CallWebSocket {
     }
   }
 
+  sendBinary(buffer) {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(buffer);
+    }
+  }
+
+  isConnected() {
+    return this.ws && this.ws.readyState === WebSocket.OPEN;
+  }
+
   disconnect() {
     if (this.ws) {
       this.ws.close();

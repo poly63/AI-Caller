@@ -1,7 +1,9 @@
+import asyncio
 import json
 import logging
 from datetime import datetime
 from uuid import UUID
+import numpy as np
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from sqlalchemy.orm import Session
 from typing import List
@@ -10,6 +12,7 @@ from app import models, schemas
 from app.core.deps import get_tenant_id
 from app.database import get_db
 from app.services.queue import get_queue_service
+from app.services.transcription import get_transcription_service
 from app.services.translation import get_translation_service
 from app.workers.post_call_worker import analyze_call_by_id
 
@@ -23,6 +26,78 @@ def _get_call_for_tenant(db: Session, tenant_id: str, call_id: str) -> models.Ca
         .filter(models.Call.id == call_id, models.Call.tenant_id == tenant_id)
         .first()
     )
+
+
+def _append_transcript_line(call: models.Call, speaker: str, text: str) -> None:
+    line = f"{speaker}: {text}".strip()
+    call.transcript = f"{(call.transcript or '').strip()}\n{line}".strip()
+
+
+def _append_transcript_segment(
+    call: models.Call,
+    *,
+    speaker: str,
+    original_text: str,
+    translated_text: str,
+    timestamp: float,
+    confidence: float,
+) -> None:
+    segments = []
+    if call.transcript_segments:
+        try:
+            segments = json.loads(call.transcript_segments)
+        except json.JSONDecodeError:
+            segments = []
+    segments.append(
+        {
+            "timestamp": timestamp,
+            "speaker": speaker,
+            "text": original_text,
+            "translated_text": translated_text,
+            "confidence": confidence,
+        }
+    )
+    call.transcript_segments = json.dumps(segments)
+
+
+def _store_transcript_message(
+    *,
+    db: Session,
+    call: models.Call,
+    speaker: str,
+    text: str,
+    source_lang: str,
+    target_lang: str,
+    timestamp: float,
+    confidence: float,
+) -> dict:
+    translated = get_translation_service().translate(
+        text,
+        source_lang=source_lang,
+        target_lang=target_lang,
+    )
+    translated_text = translated["translated_text"]
+    db.add(
+        models.CallMessage(
+            call_id=call.id,
+            speaker=speaker,
+            text=text,
+            translated_text=translated_text,
+            timestamp=timestamp,
+            confidence=confidence,
+        )
+    )
+    _append_transcript_line(call, speaker, translated_text)
+    _append_transcript_segment(
+        call,
+        speaker=speaker,
+        original_text=text,
+        translated_text=translated_text,
+        timestamp=timestamp,
+        confidence=confidence,
+    )
+    db.commit()
+    return translated
 
 
 @router.post("/start", response_model=schemas.CallResponse)
@@ -109,24 +184,16 @@ async def add_transcript_chunk(
     if not call:
         raise HTTPException(status_code=404, detail="Call not found")
 
-    translated = get_translation_service().translate(
-        payload.text,
-        source_lang=payload.source_lang,
-        target_lang=payload.target_lang,
-    )
-    message = models.CallMessage(
-        call_id=call.id,
+    translated = _store_transcript_message(
+        db=db,
+        call=call,
         speaker=payload.speaker,
         text=payload.text,
-        translated_text=translated["translated_text"],
+        source_lang=payload.source_lang,
+        target_lang=payload.target_lang,
         timestamp=payload.timestamp,
         confidence=1.0,
     )
-    db.add(message)
-    current = call.transcript or ""
-    line = f"{payload.speaker}: {translated['translated_text']}"
-    call.transcript = f"{current}\n{line}".strip()
-    db.commit()
     return {"status": "ok", "translated_text": translated["translated_text"]}
 
 
@@ -220,27 +287,100 @@ async def websocket_call_stream(
         await websocket.close()
         return
 
-    transcript_parts = []
+    speaker = "agent"
+    source_lang = call.language or "auto"
+    target_lang = call.translated_language or "en"
+    stream_start = datetime.utcnow()
     try:
         while True:
             data = await websocket.receive()
             if "text" in data:
-                text_data = json.loads(data["text"])
-                if text_data.get("type") == "transcript":
-                    transcript_parts.append(text_data.get("text", ""))
+                try:
+                    text_data = json.loads(data["text"] or "{}")
+                except json.JSONDecodeError:
+                    await websocket.send_json({"type": "error", "message": "Invalid JSON payload"})
+                    continue
+                event_type = text_data.get("type")
+                if event_type == "config":
+                    speaker = text_data.get("speaker", speaker)
+                    source_lang = text_data.get("source_lang", source_lang)
+                    target_lang = text_data.get("target_lang", target_lang)
                     await websocket.send_json(
                         {
-                            "status": "received",
-                            "text": text_data.get("text"),
+                            "type": "config_ack",
+                            "speaker": speaker,
+                            "source_lang": source_lang,
+                            "target_lang": target_lang,
+                            "call_id": call.id,
                             "timestamp": datetime.utcnow().isoformat(),
                         }
                     )
+                elif event_type == "transcript":
+                    text = (text_data.get("text") or "").strip()
+                    if not text:
+                        continue
+                    speaker = text_data.get("speaker", speaker)
+                    source_lang = text_data.get("source_lang", source_lang)
+                    target_lang = text_data.get("target_lang", target_lang)
+                    ts = float(text_data.get("timestamp") or (datetime.utcnow() - stream_start).total_seconds())
+                    translated = _store_transcript_message(
+                        db=db,
+                        call=call,
+                        speaker=speaker,
+                        text=text,
+                        source_lang=source_lang,
+                        target_lang=target_lang,
+                        timestamp=ts,
+                        confidence=1.0,
+                    )
+                    await websocket.send_json(
+                        {
+                            "type": "transcript",
+                            "speaker": speaker,
+                            "text": text,
+                            "translated_text": translated["translated_text"],
+                            "timestamp": ts,
+                            "confidence": 1.0,
+                        }
+                    )
+                elif event_type == "ping":
+                    await websocket.send_json({"type": "pong", "timestamp": datetime.utcnow().isoformat()})
             elif "bytes" in data:
-                await websocket.send_json({"status": "processing", "timestamp": datetime.utcnow().isoformat()})
+                audio_bytes = data["bytes"] or b""
+                if len(audio_bytes) < 2:
+                    continue
+                audio_array = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+                segments = await asyncio.to_thread(get_transcription_service().transcribe_audio, audio_array)
+                for segment in segments:
+                    text = (segment.get("text") or "").strip()
+                    if not text:
+                        continue
+                    ts = float(segment.get("start", (datetime.utcnow() - stream_start).total_seconds()))
+                    conf = float(segment.get("confidence", 1.0))
+                    translated = _store_transcript_message(
+                        db=db,
+                        call=call,
+                        speaker=speaker,
+                        text=text,
+                        source_lang=source_lang,
+                        target_lang=target_lang,
+                        timestamp=ts,
+                        confidence=conf,
+                    )
+                    await websocket.send_json(
+                        {
+                            "type": "transcript",
+                            "speaker": speaker,
+                            "text": text,
+                            "translated_text": translated["translated_text"],
+                            "timestamp": ts,
+                            "confidence": conf,
+                        }
+                    )
+                if not segments:
+                    await websocket.send_json({"type": "processing", "timestamp": datetime.utcnow().isoformat()})
     except WebSocketDisconnect:
-        if transcript_parts:
-            call.transcript = " ".join(transcript_parts)
-            db.commit()
+        logger.info("WebSocket disconnected for call=%s tenant=%s", call.id, tenant_id)
     except Exception as exc:
         logger.error("WebSocket error: %s", exc)
         await websocket.close()
